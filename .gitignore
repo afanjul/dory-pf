@@ -1,0 +1,20 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Built application and binaries
+/DoryPortForwarder.app
+/DoryPFGUI
+
+# Temp/test files
+/test_socket
+/test_socket.swift
+*.ips
+
+# Local user configs
+.gemini/
+.gemini-agent-id
+.idea/
+.vscode/
