@@ -57,8 +57,15 @@ if ! grep -q 'load anchor "com.dory.rdr"' "$PF_CONF" 2>/dev/null; then
 fi
 
 /sbin/pfctl -s info 2>/dev/null | grep -q "Status: Enabled" || /sbin/pfctl -e 2>/dev/null || true
-# A full pf.conf reload is intentional: on macOS, reloading only the nested
-# rdr anchor can leave local loopback redirects present but not effective after
-# Dory/PF restarts. Reloading the main ruleset keeps the anchor wired in.
-/sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || /sbin/pfctl -f "$PF_CONF" 2>&1
+if ! /sbin/pfctl -s nat 2>/dev/null | grep -q 'rdr-anchor "com.dory.rdr"'; then
+  changed=1
+fi
+
+if [ "$changed" -eq 1 ]; then
+  # Only reload the main PF ruleset when the anchor wiring changed or disappeared.
+  # Reloading it on every watchdog tick can flush container runtime NAT rules.
+  /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || /sbin/pfctl -f "$PF_CONF" 2>&1
+else
+  /sbin/pfctl -a "$ANCHOR" -f "$ANCHOR_FILE" >/dev/null 2>&1 || /sbin/pfctl -a "$ANCHOR" -f "$ANCHOR_FILE" 2>&1
+fi
 echo "$(date '+%Y-%m-%d %H:%M:%S') dory-pf: applied $rule_count rule(s); changed=$changed"
