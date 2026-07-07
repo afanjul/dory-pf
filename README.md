@@ -81,8 +81,32 @@ This generates **`DoryPortForwarder.app`** in the root directory, containing bot
     *   **Docker suggestions:** If you have running containers with public port mappings, they will appear under **Suggested Forwards (Docker)**. Just click the `[+]` button to add them instantly.
 3.  **Handling Conflicts:** If you see a red triangle `⚠️`, hover over it — it means another process (not the Dory proxy) is holding that entry port, so the forward can't work until that's resolved.
 4.  **Profiles:** Use the dropdown menu at the top to switch between forwarding environments in seconds.
-5.  **Settings:** Shows proxy status (installed/running), a **Restart Proxy** button (rarely needed — the proxy already hot-reloads on config changes), and **Uninstall**.
-6.  **Legacy migration:** If a leftover install of the old root/PF daemon is detected on your Mac, Settings shows a **Clean Up Legacy Install** button. This is the only action in the app that still asks for an admin password — it removes the old LaunchDaemon, its helper script, and the PF anchor/wiring lines (keeping a backup of `/etc/pf.conf`). It does not touch the live PF ruleset, so it won't disturb other software's rules or your container networking.
+5.  **Settings:** Shows proxy status (installed/running), a **Restart Proxy** button (the restart mechanism for the proxy service — rule edits never need it, the proxy hot-reloads its config file), and **Uninstall**.
+
+---
+
+## ⬆️ Upgrading from v1.x
+
+v1.x used a root LaunchDaemon and PF redirect rules (see "Why not PF" above). v2.0.0 carries no migration code, so if you had a v1.x install, remove its system-level leftovers once, manually:
+
+```bash
+# Stop and remove the old root daemon
+sudo launchctl bootout system/local.dory-pf 2>/dev/null || true
+
+# Back up and strip the dory-pf lines from /etc/pf.conf
+sudo cp /etc/pf.conf /etc/pf.conf.dory-pf.bak
+sudo sed -i '' -e '/# dory-pf:/d' -e '/com\.dory\.rdr/d' /etc/pf.conf
+
+# Remove the old daemon files and PF anchor
+sudo rm -f /Library/LaunchDaemons/local.dory-pf.plist \
+           /usr/local/libexec/dory-pf.sh \
+           /etc/pf.anchors/com.dory.rdr
+
+# Flush any rules still loaded in the anchor (safe if empty)
+sudo pfctl -a com.dory.rdr -F nat 2>/dev/null || true
+```
+
+Do **not** run `pfctl -f /etc/pf.conf` afterwards: reloading the live ruleset would also drop InternetSharing's dynamically attached NAT anchors used by container networking. The now-orphaned anchor attachment disappears by itself on the next natural PF reload or reboot.
 
 ---
 

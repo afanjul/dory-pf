@@ -5,6 +5,8 @@ set -e
 APP_NAME="Dory Port Forwarder"
 BUNDLE_NAME="DoryPortForwarder.app"
 BINARY_NAME="DoryPortForwarder"
+APP_VERSION="2.0.0"
+BUILD_NUMBER="2"
 
 echo "=== Building $APP_NAME ==="
 
@@ -46,9 +48,9 @@ cat <<EOF > "$BUNDLE_NAME/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$APP_VERSION</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$BUILD_NUMBER</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

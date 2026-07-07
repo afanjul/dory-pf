@@ -65,7 +65,6 @@ class PortForwardManager: ObservableObject {
     @Published var installError: String? = nil
     @Published var isProxyInstalled: Bool = false
     @Published var isProxyRunning: Bool = false
-    @Published var legacyDetected: Bool = false
 
     @Published var profiles: [Profile] = []
     @Published var activeProfileId: UUID = UUID()
@@ -92,7 +91,7 @@ class PortForwardManager: ObservableObject {
         }
         
         loadProfiles()
-        checkDaemonStatus()
+        checkProxyStatus()
     }
     
     var launchAgentPlistPath: String {
@@ -130,7 +129,7 @@ class PortForwardManager: ObservableObject {
         }
     }
 
-    func checkDaemonStatus() {
+    func checkProxyStatus() {
         let plistPath = launchAgentPlistPath
         let installed = FileManager.default.fileExists(atPath: plistPath)
         let label = launchAgentLabel
@@ -146,31 +145,8 @@ class PortForwardManager: ObservableObject {
                 self.isProxyRunning = running
             }
         }
-        detectLegacyInstall()
     }
 
-    /// Detects a leftover install of the old root LaunchDaemon + PF anchor
-    /// engine so the GUI can offer a one-time cleanup.
-    func detectLegacyInstall() {
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            let fm = FileManager.default
-            var found = fm.fileExists(atPath: "/Library/LaunchDaemons/local.dory-pf.plist")
-                || fm.fileExists(atPath: "/usr/local/libexec/dory-pf.sh")
-                || fm.fileExists(atPath: "/etc/pf.anchors/com.dory.rdr")
-            if !found, let pfConf = try? String(contentsOfFile: "/etc/pf.conf", encoding: .utf8) {
-                found = pfConf.contains("com.dory.rdr")
-            }
-            DispatchQueue.main.async {
-                self?.legacyDetected = found
-            }
-        }
-    }
-
-
-    private func shellQuote(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-    
     private func xmlEscaped(_ value: String) -> String {
         value
             .replacingOccurrences(of: "&", with: "&amp;")
@@ -179,15 +155,7 @@ class PortForwardManager: ObservableObject {
             .replacingOccurrences(of: "\"", with: "&quot;")
             .replacingOccurrences(of: "'", with: "&apos;")
     }
-    
-    private func appleScriptStringExpression(_ value: String) -> String {
-        value.components(separatedBy: "\n").map { line in
-            "\"" + line
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
-        }.joined(separator: " & linefeed & ")
-    }
-    
+
     private func validateConfigPath(_ path: String) -> String? {
         let expanded = (path as NSString).expandingTildeInPath
         guard expanded.hasPrefix("/") else { return "Config path must be absolute." }
@@ -733,7 +701,7 @@ class PortForwardManager: ObservableObject {
                 }
                 saveRules()
             }
-            checkDaemonStatus()
+            checkProxyStatus()
         } catch {
             DispatchQueue.main.async {
                 self.installError = error.localizedDescription
@@ -748,79 +716,18 @@ class PortForwardManager: ObservableObject {
         DispatchQueue.main.async {
             self.installError = nil
         }
-        checkDaemonStatus()
+        checkProxyStatus()
     }
 
-    /// Fallback "Restart proxy" action for the settings screen. Not needed
-    /// for normal rule edits (the proxy watches the config file itself),
-    /// but useful if something gets stuck.
+    /// Restarts the proxy service. Rule edits do not need this (the proxy
+    /// hot-reloads its config file); it is the user-facing restart control
+    /// for the service itself.
     func restartProxy() {
         let (status, output) = runProcess("/bin/launchctl", ["kickstart", "-k", launchAgentLabel])
         DispatchQueue.main.async {
             self.installError = status == 0 ? nil : "Restart failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
         }
-        checkDaemonStatus()
-    }
-
-    /// One-time cleanup of the old root LaunchDaemon + PF anchor engine.
-    /// This is the only remaining admin-prompt code path, used purely for
-    /// migration off the legacy install; it is never needed for normal
-    /// operation of the new proxy.
-    func migrateLegacyInstall() {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Remove legacy PF installation?"
-        alert.informativeText = """
-Dory Port Forwarder used to run a root LaunchDaemon that injected redirect \
-rules into the macOS Packet Filter (PF). That approach conflicts with \
-InternetSharing/container networking (it silently disables PF on \
-loopback) and has been replaced by a user-space proxy that needs no root \
-access at all.
-
-This will ask for your admin password once to remove the old \
-LaunchDaemon, its helper script, the PF anchor file, and the PF wiring \
-lines in /etc/pf.conf (a backup is kept at /etc/pf.conf.dory-pf.bak). The \
-live PF ruleset itself is left untouched to avoid disturbing other \
-software's rules.
-"""
-        alert.addButton(withTitle: "Clean Up Legacy Install")
-        alert.addButton(withTitle: "Not Now")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        let bashCmd = """
-launchctl bootout system/local.dory-pf 2>/dev/null || launchctl bootout system /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || true
-/sbin/pfctl -a com.dory.rdr -F nat 2>/dev/null || true
-if [ -f /etc/pf.conf ]; then
-  cp /etc/pf.conf /etc/pf.conf.dory-pf.bak
-fi
-rm -f /Library/LaunchDaemons/local.dory-pf.plist /usr/local/libexec/dory-pf.sh /etc/pf.anchors/com.dory.rdr
-if [ -f /etc/pf.conf ]; then
-  awk '
-    index($0, "# dory-pf:") == 1 { next }
-    $0 == "rdr-anchor \\"com.dory.rdr\\"" { next }
-    $0 == "load anchor \\"com.dory.rdr\\" from \\"/etc/pf.anchors/com.dory.rdr\\"" { next }
-    { print }
-  ' /etc/pf.conf > /etc/pf.conf.dory-pf.new && cat /etc/pf.conf.dory-pf.new > /etc/pf.conf && rm -f /etc/pf.conf.dory-pf.new
-fi
-"""
-        // Deliberately do NOT run `pfctl -f /etc/pf.conf` here: reloading the
-        // live ruleset would also drop InternetSharing's dynamically attached
-        // NAT anchors for container networking. The leftover (now unused)
-        // anchor attachment disappears on the next natural PF reload/reboot.
-        let appleScript = NSAppleScript(source: "do shell script (\(appleScriptStringExpression(bashCmd))) with administrator privileges")
-        var errorInfo: NSDictionary?
-        appleScript?.executeAndReturnError(&errorInfo)
-
-        if let error = errorInfo {
-            DispatchQueue.main.async {
-                self.installError = error["NSAppleScriptErrorMessage"] as? String ?? "Authorization failed"
-            }
-        } else {
-            DispatchQueue.main.async {
-                self.installError = nil
-            }
-            detectLegacyInstall()
-        }
+        checkProxyStatus()
     }
 }
 
@@ -934,36 +841,9 @@ struct SettingsView: View {
             }
             .padding(.horizontal)
 
-            if manager.legacyDetected {
-                Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundColor(.orange)
-                        Text("Legacy PF installation detected")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                    }
-                    Text("A leftover root LaunchDaemon + PF anchor from an older version is still on this Mac. It is unused by the current proxy engine but can be removed.")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button(action: {
-                        manager.migrateLegacyInstall()
-                    }) {
-                        HStack {
-                            Image(systemName: "trash")
-                            Text("Clean Up Legacy Install")
-                        }
-                    }
-                    .buttonStyle(.borderless)
-                }
-                .padding(.horizontal)
-            }
-
             Spacer()
         }
-        .frame(width: 320, height: manager.legacyDetected ? 440 : 360)
+        .frame(width: 320, height: 360)
         .onAppear {
             tempPath = manager.configPath
         }
