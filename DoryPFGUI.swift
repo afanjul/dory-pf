@@ -532,6 +532,7 @@ if [ -f "$CONF" ]; then
     case "$from$to" in *[!0-9]*) echo "dory-pf: linea invalida ignorada: $from $to" >&2; continue ;; esac
     if [ "$from" -ge 1 ] && [ "$from" -le 65535 ] && [ "$to" -ge 1 ] && [ "$to" -le 65535 ]; then
       rules="${rules}rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port = $from -> 127.0.0.1 port $to
+rdr pass on lo0 inet6 proto tcp from any to ::1 port = $from -> ::1 port $to
 "
     fi
   done < "$CONF"

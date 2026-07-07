@@ -17,6 +17,7 @@ if [ -f "$CONF" ]; then
     # Validar el rango de puertos TCP (1 - 65535)
     if [ "$from" -ge 1 ] && [ "$from" -le 65535 ] && [ "$to" -ge 1 ] && [ "$to" -le 65535 ]; then
       rules="${rules}rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port = $from -> 127.0.0.1 port $to
+rdr pass on lo0 inet6 proto tcp from any to ::1 port = $from -> ::1 port $to
 "
     fi
   done < "$CONF"
