@@ -4,6 +4,11 @@
   <img src="icon.png" width="128" height="128" alt="Dory PF Icon" />
 </p>
 
+<p align="center">
+  <img src="capture.png" width="320" alt="Dory Port Forwarder GUI Screenshot" />
+</p>
+
+
 **Dory Port Forwarder (Dory PF)** is a lightweight, native macOS menu bar application developed in Swift and SwiftUI. It simplifies port forwarding and redirection in macOS environments (highly useful for local development with **Dory**, Docker, or OrbStack) while maintaining **0% idle CPU usage**.
 
 It leverages the native macOS packet filtering engine (**PF - Packet Filter**) using a single secure loopback redirection rule (`rdr pass`), avoiding complex configurations that alter your system's global security.
