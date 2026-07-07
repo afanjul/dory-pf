@@ -69,8 +69,10 @@ class PortForwardManager: ObservableObject {
     @Published var activeProfileId: UUID = UUID()
     @Published var portStatuses: [Int: PortStatus] = [:]
     @Published var dockerSuggestions: [DockerSuggestion] = []
+    @Published var isCheckingStatuses: Bool = false
     
     private var checkTimer: Timer?
+    private var statusCheckInFlight = false
     
     var configURL: URL {
         if !configPath.isEmpty {
@@ -100,9 +102,46 @@ class PortForwardManager: ObservableObject {
         }
     }
     
+    private func shellQuote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+    
+    private func xmlEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+    }
+    
+    private func appleScriptStringExpression(_ value: String) -> String {
+        value.components(separatedBy: "\n").map { line in
+            "\"" + line
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        }.joined(separator: " & linefeed & ")
+    }
+    
+    private func validateConfigPath(_ path: String) -> String? {
+        let expanded = (path as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return "Config path must be absolute." }
+        guard !expanded.contains("\n"), !expanded.contains("\r"), !expanded.contains("\0") else {
+            return "Config path cannot contain control characters."
+        }
+        return nil
+    }
+    
     func updateConfigPath(_ path: String) {
+        if let validationError = validateConfigPath(path) {
+            DispatchQueue.main.async {
+                self.installError = validationError
+            }
+            return
+        }
         UserDefaults.standard.set(path, forKey: "configFilePath")
         DispatchQueue.main.async {
+            self.installError = nil
             self.configPath = path
             self.loadRules()
             self.performStatusChecks()
@@ -199,9 +238,9 @@ class PortForwardManager: ObservableObject {
     
     func saveRules() {
         var content = """
-# ── dory-pf: redirecciones de puertos bajos (<1024) en localhost ─────────────
-# Formato: una línea por regla → "PUERTO_ORIGEN PUERTO_DESTINO"
-# Al guardar este archivo las reglas se aplican solas (LaunchDaemon con WatchPaths).
+# ── dory-pf: low-port redirects (<1024) on localhost ─────────────────────────
+# Format: one rule per line → "SOURCE_PORT TARGET_PORT"
+# Saving this file automatically reapplies the rules (LaunchDaemon WatchPaths).
 # ──────────────────────────────────────────────────────────────────────────────
 
 """
@@ -258,11 +297,12 @@ class PortForwardManager: ObservableObject {
     
     func startMonitoring() {
         checkTimer?.invalidate()
-        checkTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        performStatusChecks()
+        checkTimer = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
             self?.performStatusChecks()
         }
-        DispatchQueue.global(qos: .background).async { [weak self] in
-            self?.performStatusChecks()
+        if let checkTimer {
+            RunLoop.main.add(checkTimer, forMode: .common)
         }
     }
     
@@ -272,12 +312,27 @@ class PortForwardManager: ObservableObject {
     }
     
     func performStatusChecks() {
-        let activeForwards = self.forwards
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard !self.statusCheckInFlight else { return }
+            self.statusCheckInFlight = true
+            self.isCheckingStatuses = true
+            let activeForwards = self.forwards
+            DispatchQueue.global(qos: .background).async { [weak self] in
+                self?.performStatusChecks(forwardsSnapshot: activeForwards)
+            }
+        }
+    }
+    
+    private func performStatusChecks(forwardsSnapshot activeForwards: [PortForward]) {
         var newStatuses: [Int: PortStatus] = [:]
         
         for forward in activeForwards {
             let srcOccupied = isSourcePortOccupied(forward.fromPort)
-            let tgtActive = isTargetPortActive(forward.toPort)
+            // Some local proxies (including Dory on macOS) can show LISTEN on the
+            // target port while direct connections to that high port stall; the
+            // PF-forwarded low port is still the user-visible health signal.
+            let tgtActive = isTargetPortActive(forward.toPort) || isTargetPortActive(forward.fromPort)
             
             var processName: String? = nil
             if srcOccupied {
@@ -291,11 +346,13 @@ class PortForwardManager: ObservableObject {
             )
         }
         
-        let suggestions = fetchDockerSuggestions()
+        let suggestions = fetchDockerSuggestions(existingForwards: activeForwards)
         
         DispatchQueue.main.async {
             self.portStatuses = newStatuses
             self.dockerSuggestions = suggestions
+            self.isCheckingStatuses = false
+            self.statusCheckInFlight = false
         }
     }
     
@@ -319,6 +376,12 @@ class PortForwardManager: ObservableObject {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
+        
+        var tv = timeval()
+        tv.tv_sec = 1
+        tv.tv_usec = 0
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         
         var addr = sockaddr_un()
         addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -363,14 +426,18 @@ class PortForwardManager: ObservableObject {
         
         guard let responseString = String(data: responseData, encoding: .utf8) else { return nil }
         
+        guard responseString.hasPrefix("HTTP/1.0 200") || responseString.hasPrefix("HTTP/1.1 200") else {
+            return nil
+        }
+        
         let parts = responseString.components(separatedBy: "\r\n\r\n")
         if parts.count >= 2 {
-            return parts[1]
+            return parts.dropFirst().joined(separator: "\r\n\r\n")
         }
         return nil
     }
     
-    func fetchDockerSuggestions() -> [DockerSuggestion] {
+    func fetchDockerSuggestions(existingForwards: [PortForward]) -> [DockerSuggestion] {
         guard let socketPath = findDockerSocket() else { return [] }
         guard let jsonString = queryDockerSocket(socketPath: socketPath, path: "/containers/json") else { return [] }
         guard let jsonData = jsonString.data(using: .utf8) else { return [] }
@@ -399,7 +466,7 @@ class PortForwardManager: ObservableObject {
                         }
                     }
                     
-                    let alreadyExists = self.forwards.contains { $0.fromPort == fromPort && $0.toPort == toPort }
+                    let alreadyExists = existingForwards.contains { $0.fromPort == fromPort && $0.toPort == toPort }
                     if !alreadyExists {
                         suggestions.append(DockerSuggestion(
                             fromPort: fromPort,
@@ -447,6 +514,10 @@ class PortForwardManager: ObservableObject {
     
     func isSourcePortOccupied(_ port: Int) -> Bool {
         guard port >= 1 && port <= 65535 else { return false }
+        return isSourcePortOccupiedIPv4(port) || isSourcePortOccupiedIPv6(port)
+    }
+    
+    private func isSourcePortOccupiedIPv4(_ port: Int) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
@@ -465,17 +536,70 @@ class PortForwardManager: ObservableObject {
         return result < 0 && errno == EADDRINUSE
     }
     
-    func isTargetPortActive(_ port: Int) -> Bool {
-        guard port >= 1 && port <= 65535 else { return false }
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
+    private func isSourcePortOccupiedIPv6(_ port: Int) -> Bool {
+        let fd = socket(AF_INET6, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
         
+        var onlyV6: Int32 = 1
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &onlyV6, socklen_t(MemoryLayout<Int32>.size))
+        
+        var addr = sockaddr_in6()
+        addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = UInt16(port).bigEndian
+        addr.sin6_addr = in6addr_loopback
+        
+        let result = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        return result < 0 && errno == EADDRINUSE
+    }
+    
+    func isTargetPortActive(_ port: Int) -> Bool {
+        guard port >= 1 && port <= 65535 else { return false }
+        return isTargetPortActiveIPv4(port) || isTargetPortActiveIPv6(port)
+    }
+    
+    private func setSocketTimeouts(_ fd: Int32) {
         var tv = timeval()
         tv.tv_sec = 0
         tv.tv_usec = 150000 // 150ms timeout
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    }
+    
+    private func connectWithTimeout(fd: Int32, timeoutMillis: Int32 = 300, _ connectCall: () -> Int32) -> Bool {
+        let originalFlags = fcntl(fd, F_GETFL, 0)
+        if originalFlags >= 0 {
+            _ = fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK)
+        }
+        defer {
+            if originalFlags >= 0 {
+                _ = fcntl(fd, F_SETFL, originalFlags)
+            }
+        }
+        
+        let result = connectCall()
+        if result == 0 { return true }
+        guard errno == EINPROGRESS else { return false }
+        
+        var pollFD = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let pollResult = poll(&pollFD, 1, timeoutMillis)
+        guard pollResult > 0, (pollFD.revents & Int16(POLLOUT)) != 0 else { return false }
+        
+        var socketError: Int32 = 0
+        var socketErrorLength = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &socketErrorLength) == 0 else { return false }
+        return socketError == 0
+    }
+    
+    private func isTargetPortActiveIPv4(_ port: Int) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
         
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -483,17 +607,48 @@ class PortForwardManager: ObservableObject {
         addr.sin_port = UInt16(port).bigEndian
         addr.sin_addr.s_addr = inet_addr("127.0.0.1")
         
-        let result = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                connectWithTimeout(fd: fd) {
+                    connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
             }
         }
-        return result == 0
+    }
+    
+    private func isTargetPortActiveIPv6(_ port: Int) -> Bool {
+        let fd = socket(AF_INET6, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        
+        var addr = sockaddr_in6()
+        addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = UInt16(port).bigEndian
+        addr.sin6_addr = in6addr_loopback
+        
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+                connectWithTimeout(fd: fd) {
+                    connect(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
+            }
+        }
     }
     
     func installDaemon() {
-        let tempScriptPath = "/tmp/dory-pf.sh"
-        let tempPlistPath = "/tmp/local.dory-pf.plist"
+        if let validationError = validateConfigPath(configURL.path) {
+            DispatchQueue.main.async {
+                self.installError = validationError
+            }
+            return
+        }
+        
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("dory-pf-\(UUID().uuidString)", isDirectory: true)
+        let tempScriptPath = tempDir.appendingPathComponent("dory-pf.sh").path
+        let tempPlistPath = tempDir.appendingPathComponent("local.dory-pf.plist").path
+        let escapedConfigPathForXML = xmlEscaped(configURL.path)
+        let quotedConfigPathForShell = shellQuote(configURL.path)
         
         let plistContent = """
 <?xml version="1.0" encoding="UTF-8"?>
@@ -508,9 +663,11 @@ class PortForwardManager: ObservableObject {
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>StartInterval</key>
+    <integer>10</integer>
     <key>WatchPaths</key>
     <array>
-        <string>\(configURL.path)</string>
+        <string>\(escapedConfigPathForXML)</string>
     </array>
     <key>StandardErrorPath</key>
     <string>/var/log/dory-pf.log</string>
@@ -522,42 +679,112 @@ class PortForwardManager: ObservableObject {
         
         let scriptContent = """
 #!/bin/sh
-CONF="\(configURL.path)"
+# dory-pf helper v2: persistent pf anchor file + watchdog reapply
+CONF=\(quotedConfigPathForShell)
 ANCHOR="com.dory.rdr"
-rules=""
+ANCHOR_FILE="/etc/pf.anchors/$ANCHOR"
+PF_CONF="/etc/pf.conf"
+TMP="$(mktemp /tmp/dory-pf-anchor.XXXXXX)" || exit 1
+changed=0
+rule_count=0
+trap 'rm -f "$TMP"' EXIT
+
 if [ -f "$CONF" ]; then
   while read -r from to _; do
     case "$from" in ""|\\#*) continue ;; esac
     [ -n "$to" ] || continue
-    case "$from$to" in *[!0-9]*) echo "dory-pf: linea invalida ignorada: $from $to" >&2; continue ;; esac
+    case "$from$to" in *[!0-9]*) echo "$(date '+%Y-%m-%d %H:%M:%S') dory-pf: invalid line ignored: $from $to" >&2; continue ;; esac
     if [ "$from" -ge 1 ] && [ "$from" -le 65535 ] && [ "$to" -ge 1 ] && [ "$to" -le 65535 ]; then
-      rules="${rules}rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port = $from -> 127.0.0.1 port $to
-rdr pass on lo0 inet6 proto tcp from any to ::1 port = $from -> ::1 port $to
-"
+      # Dory's proxy binds IPv4 loopback high ports. Keep the pf rule IPv4-only,
+      # matching Dory's own networking helper and avoiding ::1 -> ::1 stalls.
+      printf 'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port %s -> 127.0.0.1 port %s\\n' "$from" "$to" >> "$TMP"
+      rule_count=$((rule_count + 1))
     fi
   done < "$CONF"
 fi
-/sbin/pfctl -E 2>/dev/null || true
-printf '%s' "$rules" | /sbin/pfctl -a "$ANCHOR" -f -
+
+mkdir -p /etc/pf.anchors
+if [ ! -f "$ANCHOR_FILE" ] || ! cmp -s "$TMP" "$ANCHOR_FILE"; then
+  install -o root -g wheel -m 644 "$TMP" "$ANCHOR_FILE"
+  changed=1
+fi
+
+if ! grep -q 'rdr-anchor "com.dory.rdr"' "$PF_CONF" 2>/dev/null; then
+  PF_TMP="$PF_CONF.dory-pf.$$"
+  inserted=0
+  while IFS= read -r line; do
+    printf '%s\\n' "$line" >> "$PF_TMP"
+    if [ "$line" = 'rdr-anchor "com.apple/*"' ]; then
+      printf '# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\\n' >> "$PF_TMP"
+      printf 'rdr-anchor "com.dory.rdr"\\n' >> "$PF_TMP"
+      inserted=1
+    fi
+  done < "$PF_CONF"
+  if [ "$inserted" -eq 0 ]; then
+    printf '\\n# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\\n' >> "$PF_TMP"
+    printf 'rdr-anchor "com.dory.rdr"\\n' >> "$PF_TMP"
+  fi
+  cat "$PF_TMP" > "$PF_CONF" && rm -f "$PF_TMP"
+  changed=1
+fi
+if ! grep -q 'load anchor "com.dory.rdr"' "$PF_CONF" 2>/dev/null; then
+  printf 'load anchor "com.dory.rdr" from "/etc/pf.anchors/com.dory.rdr"\\n' >> "$PF_CONF"
+  changed=1
+fi
+
+/sbin/pfctl -s info 2>/dev/null | grep -q "Status: Enabled" || /sbin/pfctl -e 2>/dev/null || true
+# A full pf.conf reload is intentional: on macOS, reloading only the nested
+# rdr anchor can leave local loopback redirects present but not effective after
+# Dory/PF restarts. Reloading the main ruleset keeps the anchor wired in.
+/sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || /sbin/pfctl -f "$PF_CONF" 2>&1
+echo "$(date '+%Y-%m-%d %H:%M:%S') dory-pf: applied $rule_count rule(s); changed=$changed"
 """
         
         do {
+            try FileManager.default.createDirectory(
+                at: tempDir,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
             try plistContent.write(toFile: tempPlistPath, atomically: true, encoding: .utf8)
             try scriptContent.write(toFile: tempScriptPath, atomically: true, encoding: .utf8)
             
+            let quotedTempScriptPath = shellQuote(tempScriptPath)
+            let quotedTempPlistPath = shellQuote(tempPlistPath)
             let bashCmd = """
-mkdir -p /usr/local/libexec && \
-cp \(tempScriptPath) /usr/local/libexec/dory-pf.sh && \
-chmod +x /usr/local/libexec/dory-pf.sh && \
-cp \(tempPlistPath) /Library/LaunchDaemons/local.dory-pf.plist && \
-if ! grep -q 'rdr-anchor "com.dory.rdr"' /etc/pf.conf; then \
-  perl -pi -e 's/rdr-anchor "com.apple\\\\\\/\\\\\\*"/rdr-anchor "com.apple\\\\\\/\\\\\\*"\n# dory-pf: reglas cargadas por \\/usr\\/local\\/libexec\\/dory-pf.sh\nrdr-anchor "com.dory.rdr"/g' /etc/pf.conf; \
-fi && \
-launchctl load -w /Library/LaunchDaemons/local.dory-pf.plist && \
-pfctl -f /etc/pf.conf
+set -e
+mkdir -p /usr/local/libexec /etc/pf.anchors
+install -o root -g wheel -m 755 \(quotedTempScriptPath) /usr/local/libexec/dory-pf.sh
+install -o root -g wheel -m 644 \(quotedTempPlistPath) /Library/LaunchDaemons/local.dory-pf.plist
+[ -f /etc/pf.anchors/com.dory.rdr ] || install -o root -g wheel -m 644 /dev/null /etc/pf.anchors/com.dory.rdr
+if ! grep -q 'rdr-anchor "com.dory.rdr"' /etc/pf.conf; then
+  PF_TMP="/etc/pf.conf.dory-pf.$$"
+  inserted=0
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$PF_TMP"
+    if [ "$line" = 'rdr-anchor "com.apple/*"' ]; then
+      printf '# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\n' >> "$PF_TMP"
+      printf 'rdr-anchor "com.dory.rdr"\n' >> "$PF_TMP"
+      inserted=1
+    fi
+  done < /etc/pf.conf
+  if [ "$inserted" -eq 0 ]; then
+    printf '\n# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\n' >> "$PF_TMP"
+    printf 'rdr-anchor "com.dory.rdr"\n' >> "$PF_TMP"
+  fi
+  cat "$PF_TMP" > /etc/pf.conf && rm -f "$PF_TMP"
+fi
+if ! grep -q 'load anchor "com.dory.rdr"' /etc/pf.conf; then
+  printf 'load anchor "com.dory.rdr" from "/etc/pf.anchors/com.dory.rdr"\n' >> /etc/pf.conf
+fi
+/usr/local/libexec/dory-pf.sh
+launchctl bootout system /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || launchctl unload -w /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || true
+launchctl bootstrap system /Library/LaunchDaemons/local.dory-pf.plist
+launchctl enable system/local.dory-pf
+launchctl kickstart -k system/local.dory-pf
 """
             
-            let appleScriptSource = "do shell script \"\(bashCmd)\" with administrator privileges"
+            let appleScriptSource = "do shell script (\(appleScriptStringExpression(bashCmd))) with administrator privileges"
             let appleScript = NSAppleScript(source: appleScriptSource)
             var errorInfo: NSDictionary?
             appleScript?.executeAndReturnError(&errorInfo)
@@ -570,12 +797,12 @@ pfctl -f /etc/pf.conf
                 DispatchQueue.main.async {
                     self.installError = nil
                 }
-                try? FileManager.default.removeItem(atPath: tempScriptPath)
-                try? FileManager.default.removeItem(atPath: tempPlistPath)
                 checkDaemonStatus()
                 saveRules()
             }
+            try? FileManager.default.removeItem(at: tempDir)
         } catch {
+            try? FileManager.default.removeItem(at: tempDir)
             DispatchQueue.main.async {
                 self.installError = error.localizedDescription
             }
@@ -584,12 +811,18 @@ pfctl -f /etc/pf.conf
     
     func uninstallDaemon() {
         let bashCmd = """
-launchctl unload -w /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || true && \
-rm -f /Library/LaunchDaemons/local.dory-pf.plist /usr/local/libexec/dory-pf.sh && \
-perl -pi -e 's/# dory-pf: reglas cargadas por \\/usr\\/local\\/libexec\\/dory-pf.sh\nrdr-anchor "com.dory.rdr"\n//g' /etc/pf.conf && \
-pfctl -f /etc/pf.conf
+launchctl bootout system /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || launchctl unload -w /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || true
+/sbin/pfctl -a com.dory.rdr -F all 2>/dev/null || true
+rm -f /Library/LaunchDaemons/local.dory-pf.plist /usr/local/libexec/dory-pf.sh /etc/pf.anchors/com.dory.rdr
+awk '
+  index($0, "# dory-pf:") == 1 { next }
+  $0 == "rdr-anchor \"com.dory.rdr\"" { next }
+  $0 == "load anchor \"com.dory.rdr\" from \"/etc/pf.anchors/com.dory.rdr\"" { next }
+  { print }
+' /etc/pf.conf > /tmp/dory-pf.conf && cat /tmp/dory-pf.conf > /etc/pf.conf && rm -f /tmp/dory-pf.conf
+/sbin/pfctl -f /etc/pf.conf
 """
-        let appleScript = NSAppleScript(source: "do shell script \"\(bashCmd)\" with administrator privileges")
+        let appleScript = NSAppleScript(source: "do shell script (\(appleScriptStringExpression(bashCmd))) with administrator privileges")
         var errorInfo: NSDictionary?
         appleScript?.executeAndReturnError(&errorInfo)
         
@@ -778,6 +1011,54 @@ struct OnboardingView: View {
     }
 }
 
+struct ConflictInfoTooltip: View {
+    let port: Int
+    let processName: String?
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                Text("Possible port conflict")
+                    .font(.headline)
+                    .fontWeight(.semibold)
+            }
+            
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Local port \(port) is already bound")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                if let processName, !processName.isEmpty {
+                    Text("Detected process: \(processName)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            Text("PF may still redirect traffic, but the local listener can bypass or interfere with the rule depending on how the connection is made.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            
+            Text("If this forward behaves unexpectedly, stop the conflicting service or use a different entry port.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .frame(width: 265, alignment: .leading)
+        .background(Color(NSColor.windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.22), radius: 14, x: 0, y: 8)
+        .allowsHitTesting(false)
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var manager: PortForwardManager
     @Binding var showSettings: Bool
@@ -786,6 +1067,7 @@ struct ContentView: View {
     
     @State private var showAddProfileCard = false
     @State private var newProfileName = ""
+    @State private var hoveredConflictPort: Int? = nil
     
     var body: some View {
         VStack(spacing: 12) {
@@ -925,15 +1207,48 @@ struct ContentView: View {
                             .padding(.vertical, 20)
                     } else {
                         ForEach(manager.forwards, id: \.self) { forward in
-                            let status = manager.portStatuses[forward.fromPort] ?? PortStatus()
+                            let status = manager.portStatuses[forward.fromPort]
+                            let sourceOccupied = status?.sourceOccupied ?? false
+                            let targetActive = status?.targetActive ?? false
+                            let isKnown = status != nil
                             HStack(spacing: 6) {
-                                // Conflict Warning
-                                if status.sourceOccupied {
-                                    let processLabel = status.occupyingProcessName.map { " (occupied by \($0))" } ?? ""
-                                    Image(systemName: "exclamationmark.triangle.fill")
-                                        .foregroundColor(.red)
-                                        .help("Conflict: Local port \(forward.fromPort) is bound by another application\(processLabel)!")
+                                // Conflict warning slot. Keep a fixed width even when hidden so
+                                // all source/target ports stay vertically aligned across rows.
+                                ZStack {
+                                    if sourceOccupied {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .foregroundColor(.red)
+                                            .contentShape(Rectangle())
+                                            .onHover { isHovering in
+                                                withAnimation(.easeInOut(duration: 0.12)) {
+                                                    if isHovering {
+                                                        hoveredConflictPort = forward.fromPort
+                                                    } else if hoveredConflictPort == forward.fromPort {
+                                                        hoveredConflictPort = nil
+                                                    }
+                                                }
+                                            }
+                                            .popover(
+                                                isPresented: Binding(
+                                                    get: { hoveredConflictPort == forward.fromPort },
+                                                    set: { isPresented in
+                                                        if !isPresented, hoveredConflictPort == forward.fromPort {
+                                                            hoveredConflictPort = nil
+                                                        }
+                                                    }
+                                                ),
+                                                attachmentAnchor: .rect(.bounds),
+                                                arrowEdge: .leading
+                                            ) {
+                                                ConflictInfoTooltip(
+                                                    port: forward.fromPort,
+                                                    processName: status?.occupyingProcessName
+                                                )
+                                                .padding(4)
+                                            }
+                                    }
                                 }
+                                .frame(width: 22, alignment: .center)
                                 
                                 Text(String(forward.fromPort))
                                     .fontWeight(.bold)
@@ -951,13 +1266,13 @@ struct ContentView: View {
                                 // Destination port check
                                 HStack(spacing: 4) {
                                     Circle()
-                                        .fill(status.targetActive ? Color.green : Color.gray)
+                                        .fill(isKnown ? (targetActive ? Color.green : Color.gray) : Color.orange)
                                         .frame(width: 8, height: 8)
-                                    Text(status.targetActive ? "active" : "inactive")
+                                    Text(isKnown ? (targetActive ? "active" : "inactive") : "checking…")
                                         .font(.caption2)
                                         .foregroundColor(.secondary)
                                 }
-                                .help(status.targetActive ? "Target container port \(forward.toPort) is listening." : "No listening process detected on target port \(forward.toPort). Verify if your container is running.")
+                                .help(!isKnown ? "Checking forward status…" : (targetActive ? "Forward is reachable via target port \(forward.toPort) or forwarded port \(forward.fromPort)." : "No reachable listener detected on target port \(forward.toPort) or forwarded port \(forward.fromPort). Verify if your container is running and PF rules are loaded."))
                                 
                                 Spacer().frame(width: 10)
                                 
@@ -973,6 +1288,7 @@ struct ContentView: View {
                             .padding(.horizontal, 8)
                             .background(Color(NSColor.alternatingContentBackgroundColors[0]))
                             .cornerRadius(6)
+                            .zIndex(hoveredConflictPort == forward.fromPort ? 50 : 0)
                         }
                     }
                 }
@@ -1063,6 +1379,12 @@ struct ContentView: View {
             .padding(.bottom, 12)
         }
         .frame(width: 320, height: 360)
+        .onAppear {
+            manager.performStatusChecks()
+        }
+        .onChange(of: manager.forwards) {
+            manager.performStatusChecks()
+        }
     }
 }
 
@@ -1083,6 +1405,9 @@ struct MainView: View {
             }
         }
         .onAppear {
+            manager.startMonitoring()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
             manager.startMonitoring()
         }
         .onDisappear {

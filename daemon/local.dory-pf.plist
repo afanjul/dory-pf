@@ -10,11 +10,12 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>StartInterval</key>
+    <integer>10</integer>
     <key>WatchPaths</key>
     <array>
-        <!-- This path will be watched for changes and triggers the script execution. -->
-        <!-- The default path is ~/.dory/port-forwards.conf (expanded to your user directory). -->
-        <string>/Users/aleksdj/.dory/port-forwards.conf</string>
+        <!-- Template path. The GUI installer generates a user-specific copy. -->
+        <string>/Users/REPLACE_ME/.dory/port-forwards.conf</string>
     </array>
     <key>StandardErrorPath</key>
     <string>/var/log/dory-pf.log</string>
