@@ -36,7 +36,15 @@ Dory PF uses a decoupled and secure design:
 *   macOS 13.0 (Ventura) or newer.
 *   Dory, Docker Desktop, or OrbStack installed and running.
 
-### Build and Package
+### Option A: Using Pre-built Releases (ZIP)
+1. Download **`DoryPortForwarder.zip`** from the latest GitHub Release and extract it.
+2. Drag the extracted **`Dory Port Forwarder.app`** to your `/Applications` folder.
+3. Open your terminal and run the following command to remove the macOS quarantine flag (Gatekeeper):
+   ```bash
+   xattr -r -d com.apple.quarantine /Applications/Dory\ Port\ Forwarder.app
+   ```
+
+### Option B: Build and Package from Source
 To build your native `.app` bundle with its custom icon automatically, clone the repository and run the build script:
 
 ```bash
