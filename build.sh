@@ -12,13 +12,17 @@ echo "=== Building $APP_NAME ==="
 echo "Compiling Swift source..."
 swiftc -O -sdk $(xcrun --show-sdk-path) -parse-as-library DoryPFGUI.swift -o "$BINARY_NAME"
 
+echo "Compiling proxy engine..."
+swiftc -O -sdk $(xcrun --show-sdk-path) proxy/dory-pf-proxy.swift -o dory-pf-proxy
+
 # 2. Create App Bundle structure
 echo "Creating app bundle structure..."
 mkdir -p "$BUNDLE_NAME/Contents/MacOS"
 mkdir -p "$BUNDLE_NAME/Contents/Resources"
 
-# 3. Move binary and resources
+# 3. Move binaries and resources
 mv "$BINARY_NAME" "$BUNDLE_NAME/Contents/MacOS/$BINARY_NAME"
+mv dory-pf-proxy "$BUNDLE_NAME/Contents/MacOS/dory-pf-proxy"
 if [ -f "AppIcon.icns" ]; then
   echo "Copying AppIcon.icns..."
   cp "AppIcon.icns" "$BUNDLE_NAME/Contents/Resources/AppIcon.icns"
@@ -54,6 +58,14 @@ cat <<EOF > "$BUNDLE_NAME/Contents/Info.plist"
 </dict>
 </plist>
 EOF
+
+# 5. Ad-hoc codesign both binaries. This reduces macOS firewall/Gatekeeper
+# prompts on launch; it does not require any credentials or admin rights.
+if command -v codesign >/dev/null 2>&1; then
+  echo "Ad-hoc signing binaries..."
+  codesign --force --sign - "$BUNDLE_NAME/Contents/MacOS/dory-pf-proxy" 2>/dev/null || true
+  codesign --force --sign - "$BUNDLE_NAME/Contents/MacOS/$BINARY_NAME" 2>/dev/null || true
+fi
 
 echo "=== Build Successful! ==="
 echo "You can find your app at: $(pwd)/$BUNDLE_NAME"

@@ -63,8 +63,10 @@ class PortForwardManager: ObservableObject {
     @Published var forwards: [PortForward] = []
     @Published var configPath: String = ""
     @Published var installError: String? = nil
-    @Published var isDaemonInstalled: Bool = false
-    
+    @Published var isProxyInstalled: Bool = false
+    @Published var isProxyRunning: Bool = false
+    @Published var legacyDetected: Bool = false
+
     @Published var profiles: [Profile] = []
     @Published var activeProfileId: UUID = UUID()
     @Published var portStatuses: [Int: PortStatus] = [:]
@@ -93,15 +95,78 @@ class PortForwardManager: ObservableObject {
         checkDaemonStatus()
     }
     
-    func checkDaemonStatus() {
-        let plistPath = "/Library/LaunchDaemons/local.dory-pf.plist"
-        let scriptPath = "/usr/local/libexec/dory-pf.sh"
-        let installed = FileManager.default.fileExists(atPath: plistPath) && FileManager.default.fileExists(atPath: scriptPath)
-        DispatchQueue.main.async {
-            self.isDaemonInstalled = installed
+    var launchAgentPlistPath: String {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/local.dory-pf-proxy.plist").path
+    }
+
+    var proxyLogPath: String {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/dory-pf-proxy.log").path
+    }
+
+    var proxyBinaryPath: String {
+        Bundle.main.bundlePath + "/Contents/MacOS/dory-pf-proxy"
+    }
+
+    private var launchAgentLabel: String {
+        "gui/\(getuid())/local.dory-pf-proxy"
+    }
+
+    @discardableResult
+    private func runProcess(_ path: String, _ args: [String]) -> (status: Int32, output: String) {
+        let task = Process()
+        task.launchPath = path
+        task.arguments = args
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        do {
+            try task.run()
+            task.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return (task.terminationStatus, output)
+        } catch {
+            return (-1, error.localizedDescription)
         }
     }
-    
+
+    func checkDaemonStatus() {
+        let plistPath = launchAgentPlistPath
+        let installed = FileManager.default.fileExists(atPath: plistPath)
+        let label = launchAgentLabel
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            guard let self else { return }
+            var running = false
+            if installed {
+                let (status, output) = self.runProcess("/bin/launchctl", ["print", label])
+                running = status == 0 && output.contains("state = running")
+            }
+            DispatchQueue.main.async {
+                self.isProxyInstalled = installed
+                self.isProxyRunning = running
+            }
+        }
+        detectLegacyInstall()
+    }
+
+    /// Detects a leftover install of the old root LaunchDaemon + PF anchor
+    /// engine so the GUI can offer a one-time cleanup.
+    func detectLegacyInstall() {
+        DispatchQueue.global(qos: .background).async { [weak self] in
+            let fm = FileManager.default
+            var found = fm.fileExists(atPath: "/Library/LaunchDaemons/local.dory-pf.plist")
+                || fm.fileExists(atPath: "/usr/local/libexec/dory-pf.sh")
+                || fm.fileExists(atPath: "/etc/pf.anchors/com.dory.rdr")
+            if !found, let pfConf = try? String(contentsOfFile: "/etc/pf.conf", encoding: .utf8) {
+                found = pfConf.contains("com.dory.rdr")
+            }
+            DispatchQueue.main.async {
+                self?.legacyDetected = found
+            }
+        }
+    }
+
+
     private func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
@@ -240,7 +305,8 @@ class PortForwardManager: ObservableObject {
         var content = """
 # ── dory-pf: low-port redirects (<1024) on localhost ─────────────────────────
 # Format: one rule per line → "SOURCE_PORT TARGET_PORT"
-# Saving this file automatically reapplies the rules (LaunchDaemon WatchPaths).
+# Saving this file is picked up automatically by the dory-pf-proxy LaunchAgent
+# (it watches this file and hot-reloads within about a second).
 # ──────────────────────────────────────────────────────────────────────────────
 
 """
@@ -328,19 +394,25 @@ class PortForwardManager: ObservableObject {
         var newStatuses: [Int: PortStatus] = [:]
         
         for forward in activeForwards {
-            let srcOccupied = isSourcePortOccupied(forward.fromPort)
-            // Some local proxies (including Dory on macOS) can show LISTEN on the
-            // target port while direct connections to that high port stall; the
-            // PF-forwarded low port is still the user-visible health signal.
-            let tgtActive = isTargetPortActive(forward.toPort) || isTargetPortActive(forward.fromPort)
-            
+            // With the user-space proxy engine, the entry (low) port is a
+            // real listening socket owned by our own proxy process, not a
+            // kernel-level PF redirect. So "is something listening on the
+            // entry port" is expected and healthy when it's our proxy; it's
+            // only a genuine conflict when a *different* process holds it
+            // (which also means our proxy failed to bind it).
+            let entryPortListening = isTargetPortActive(forward.fromPort)
+            let tgtActive = isTargetPortActive(forward.toPort)
+
             var processName: String? = nil
-            if srcOccupied {
+            var foreignConflict = false
+            if entryPortListening {
                 processName = getProcessOccupyingPort(forward.fromPort)
+                let isOurProxy = processName?.lowercased().contains("dory-pf-proxy") ?? false
+                foreignConflict = !isOurProxy
             }
-            
+
             newStatuses[forward.fromPort] = PortStatus(
-                sourceOccupied: srcOccupied,
+                sourceOccupied: foreignConflict,
                 targetActive: tgtActive,
                 occupyingProcessName: processName
             )
@@ -512,52 +584,6 @@ class PortForwardManager: ObservableObject {
         return nil
     }
     
-    func isSourcePortOccupied(_ port: Int) -> Bool {
-        guard port >= 1 && port <= 65535 else { return false }
-        return isSourcePortOccupiedIPv4(port) || isSourcePortOccupiedIPv6(port)
-    }
-    
-    private func isSourcePortOccupiedIPv4(_ port: Int) -> Bool {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
-        
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-        
-        let result = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        return result < 0 && errno == EADDRINUSE
-    }
-    
-    private func isSourcePortOccupiedIPv6(_ port: Int) -> Bool {
-        let fd = socket(AF_INET6, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
-        defer { close(fd) }
-        
-        var onlyV6: Int32 = 1
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &onlyV6, socklen_t(MemoryLayout<Int32>.size))
-        
-        var addr = sockaddr_in6()
-        addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-        addr.sin6_family = sa_family_t(AF_INET6)
-        addr.sin6_port = UInt16(port).bigEndian
-        addr.sin6_addr = in6addr_loopback
-        
-        let result = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-            }
-        }
-        return result < 0 && errno == EADDRINUSE
-    }
-    
     func isTargetPortActive(_ port: Int) -> Bool {
         guard port >= 1 && port <= 65535 else { return false }
         return isTargetPortActiveIPv4(port) || isTargetPortActiveIPv6(port)
@@ -636,203 +662,155 @@ class PortForwardManager: ObservableObject {
         }
     }
     
-    func installDaemon() {
+    /// Installs and starts the user-space proxy as a LaunchAgent. No admin
+    /// prompt: everything happens in the user's own launchd domain.
+    func installProxy() {
         if let validationError = validateConfigPath(configURL.path) {
             DispatchQueue.main.async {
                 self.installError = validationError
             }
             return
         }
-        
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("dory-pf-\(UUID().uuidString)", isDirectory: true)
-        let tempScriptPath = tempDir.appendingPathComponent("dory-pf.sh").path
-        let tempPlistPath = tempDir.appendingPathComponent("local.dory-pf.plist").path
-        let escapedConfigPathForXML = xmlEscaped(configURL.path)
-        let quotedConfigPathForShell = shellQuote(configURL.path)
-        
+
+        let binaryPath = proxyBinaryPath
+        guard FileManager.default.fileExists(atPath: binaryPath) else {
+            DispatchQueue.main.async {
+                self.installError = "Proxy binary not found at \(binaryPath). Rebuild the app with build.sh."
+            }
+            return
+        }
+
+        let plistPath = launchAgentPlistPath
+        let logPath = proxyLogPath
+        let escapedBinaryPath = xmlEscaped(binaryPath)
+        let escapedLogPath = xmlEscaped(logPath)
+
         let plistContent = """
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>local.dory-pf</string>
+    <string>local.dory-pf-proxy</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/libexec/dory-pf.sh</string>
+        <string>\(escapedBinaryPath)</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
-    <key>StartInterval</key>
-    <integer>10</integer>
-    <key>WatchPaths</key>
-    <array>
-        <string>\(escapedConfigPathForXML)</string>
-    </array>
-    <key>StandardErrorPath</key>
-    <string>/var/log/dory-pf.log</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
     <key>StandardOutPath</key>
-    <string>/var/log/dory-pf.log</string>
+    <string>\(escapedLogPath)</string>
+    <key>StandardErrorPath</key>
+    <string>\(escapedLogPath)</string>
 </dict>
 </plist>
 """
-        
-        let scriptContent = """
-#!/bin/sh
-# dory-pf helper v2: persistent pf anchor file + watchdog reapply
-CONF=\(quotedConfigPathForShell)
-ANCHOR="com.dory.rdr"
-ANCHOR_FILE="/etc/pf.anchors/$ANCHOR"
-PF_CONF="/etc/pf.conf"
-TMP="$(mktemp /tmp/dory-pf-anchor.XXXXXX)" || exit 1
-changed=0
-rule_count=0
-trap 'rm -f "$TMP"' EXIT
 
-if [ -f "$CONF" ]; then
-  while read -r from to _; do
-    case "$from" in ""|\\#*) continue ;; esac
-    [ -n "$to" ] || continue
-    case "$from$to" in *[!0-9]*) echo "$(date '+%Y-%m-%d %H:%M:%S') dory-pf: invalid line ignored: $from $to" >&2; continue ;; esac
-    if [ "$from" -ge 1 ] && [ "$from" -le 65535 ] && [ "$to" -ge 1 ] && [ "$to" -le 65535 ]; then
-      # Dory's proxy binds IPv4 loopback high ports. Keep the pf rule IPv4-only,
-      # matching Dory's own networking helper and avoiding ::1 -> ::1 stalls.
-      printf 'rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port %s -> 127.0.0.1 port %s\\n' "$from" "$to" >> "$TMP"
-      rule_count=$((rule_count + 1))
-    fi
-  done < "$CONF"
-fi
-
-mkdir -p /etc/pf.anchors
-if [ ! -f "$ANCHOR_FILE" ] || ! cmp -s "$TMP" "$ANCHOR_FILE"; then
-  install -o root -g wheel -m 644 "$TMP" "$ANCHOR_FILE"
-  changed=1
-fi
-
-if ! grep -q 'rdr-anchor "com.dory.rdr"' "$PF_CONF" 2>/dev/null; then
-  PF_TMP="$PF_CONF.dory-pf.$$"
-  inserted=0
-  while IFS= read -r line; do
-    printf '%s\\n' "$line" >> "$PF_TMP"
-    if [ "$line" = 'rdr-anchor "com.apple/*"' ]; then
-      printf '# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\\n' >> "$PF_TMP"
-      printf 'rdr-anchor "com.dory.rdr"\\n' >> "$PF_TMP"
-      inserted=1
-    fi
-  done < "$PF_CONF"
-  if [ "$inserted" -eq 0 ]; then
-    printf '\\n# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\\n' >> "$PF_TMP"
-    printf 'rdr-anchor "com.dory.rdr"\\n' >> "$PF_TMP"
-  fi
-  cat "$PF_TMP" > "$PF_CONF" && rm -f "$PF_TMP"
-  changed=1
-fi
-if ! grep -q 'load anchor "com.dory.rdr"' "$PF_CONF" 2>/dev/null; then
-  printf 'load anchor "com.dory.rdr" from "/etc/pf.anchors/com.dory.rdr"\\n' >> "$PF_CONF"
-  changed=1
-fi
-
-/sbin/pfctl -s info 2>/dev/null | grep -q "Status: Enabled" || /sbin/pfctl -e 2>/dev/null || true
-if ! /sbin/pfctl -s nat 2>/dev/null | grep -q 'rdr-anchor "com.dory.rdr"'; then
-  changed=1
-fi
-
-if [ "$changed" -eq 1 ]; then
-  # Only reload the main PF ruleset when the anchor wiring changed or disappeared.
-  # Reloading it on every watchdog tick can flush container runtime NAT rules.
-  /sbin/pfctl -f "$PF_CONF" >/dev/null 2>&1 || /sbin/pfctl -f "$PF_CONF" 2>&1
-else
-  /sbin/pfctl -a "$ANCHOR" -f "$ANCHOR_FILE" >/dev/null 2>&1 || /sbin/pfctl -a "$ANCHOR" -f "$ANCHOR_FILE" 2>&1
-fi
-echo "$(date '+%Y-%m-%d %H:%M:%S') dory-pf: applied $rule_count rule(s); changed=$changed"
-"""
-        
         do {
-            try FileManager.default.createDirectory(
-                at: tempDir,
-                withIntermediateDirectories: false,
-                attributes: [.posixPermissions: 0o700]
-            )
-            try plistContent.write(toFile: tempPlistPath, atomically: true, encoding: .utf8)
-            try scriptContent.write(toFile: tempScriptPath, atomically: true, encoding: .utf8)
-            
-            let quotedTempScriptPath = shellQuote(tempScriptPath)
-            let quotedTempPlistPath = shellQuote(tempPlistPath)
-            let bashCmd = """
-set -e
-mkdir -p /usr/local/libexec /etc/pf.anchors
-install -o root -g wheel -m 755 \(quotedTempScriptPath) /usr/local/libexec/dory-pf.sh
-install -o root -g wheel -m 644 \(quotedTempPlistPath) /Library/LaunchDaemons/local.dory-pf.plist
-[ -f /etc/pf.anchors/com.dory.rdr ] || install -o root -g wheel -m 644 /dev/null /etc/pf.anchors/com.dory.rdr
-if ! grep -q 'rdr-anchor "com.dory.rdr"' /etc/pf.conf; then
-  PF_TMP="/etc/pf.conf.dory-pf.$$"
-  inserted=0
-  while IFS= read -r line; do
-    printf '%s\n' "$line" >> "$PF_TMP"
-    if [ "$line" = 'rdr-anchor "com.apple/*"' ]; then
-      printf '# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\n' >> "$PF_TMP"
-      printf 'rdr-anchor "com.dory.rdr"\n' >> "$PF_TMP"
-      inserted=1
-    fi
-  done < /etc/pf.conf
-  if [ "$inserted" -eq 0 ]; then
-    printf '\n# dory-pf: rules loaded by /usr/local/libexec/dory-pf.sh from ~/.dory/port-forwards.conf\n' >> "$PF_TMP"
-    printf 'rdr-anchor "com.dory.rdr"\n' >> "$PF_TMP"
-  fi
-  cat "$PF_TMP" > /etc/pf.conf && rm -f "$PF_TMP"
-fi
-if ! grep -q 'load anchor "com.dory.rdr"' /etc/pf.conf; then
-  printf 'load anchor "com.dory.rdr" from "/etc/pf.anchors/com.dory.rdr"\n' >> /etc/pf.conf
-fi
-/usr/local/libexec/dory-pf.sh
-launchctl bootout system /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || launchctl unload -w /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || true
-launchctl bootstrap system /Library/LaunchDaemons/local.dory-pf.plist
-launchctl enable system/local.dory-pf
-launchctl kickstart -k system/local.dory-pf
-"""
-            
-            let appleScriptSource = "do shell script (\(appleScriptStringExpression(bashCmd))) with administrator privileges"
-            let appleScript = NSAppleScript(source: appleScriptSource)
-            var errorInfo: NSDictionary?
-            appleScript?.executeAndReturnError(&errorInfo)
-            
-            if let error = errorInfo {
+            let agentsDir = (plistPath as NSString).deletingLastPathComponent
+            try FileManager.default.createDirectory(atPath: agentsDir, withIntermediateDirectories: true)
+            let logsDir = (logPath as NSString).deletingLastPathComponent
+            try FileManager.default.createDirectory(atPath: logsDir, withIntermediateDirectories: true)
+            try plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
+
+            // If already loaded (e.g. re-install), bootout first so bootstrap
+            // doesn't fail with "already loaded".
+            _ = runProcess("/bin/launchctl", ["bootout", launchAgentLabel])
+            let (status, output) = runProcess("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistPath])
+
+            if status != 0 {
                 DispatchQueue.main.async {
-                    self.installError = error["NSAppleScriptErrorMessage"] as? String ?? "Authorization failed"
+                    self.installError = "launchctl bootstrap failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
                 }
             } else {
+                _ = runProcess("/bin/launchctl", ["kickstart", "-k", launchAgentLabel])
                 DispatchQueue.main.async {
                     self.installError = nil
                 }
-                checkDaemonStatus()
                 saveRules()
             }
-            try? FileManager.default.removeItem(at: tempDir)
+            checkDaemonStatus()
         } catch {
-            try? FileManager.default.removeItem(at: tempDir)
             DispatchQueue.main.async {
                 self.installError = error.localizedDescription
             }
         }
     }
-    
-    func uninstallDaemon() {
-        let bashCmd = """
-launchctl bootout system /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || launchctl unload -w /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || true
-/sbin/pfctl -a com.dory.rdr -F all 2>/dev/null || true
-rm -f /Library/LaunchDaemons/local.dory-pf.plist /usr/local/libexec/dory-pf.sh /etc/pf.anchors/com.dory.rdr
-awk '
-  index($0, "# dory-pf:") == 1 { next }
-  $0 == "rdr-anchor \"com.dory.rdr\"" { next }
-  $0 == "load anchor \"com.dory.rdr\" from \"/etc/pf.anchors/com.dory.rdr\"" { next }
-  { print }
-' /etc/pf.conf > /tmp/dory-pf.conf && cat /tmp/dory-pf.conf > /etc/pf.conf && rm -f /tmp/dory-pf.conf
-/sbin/pfctl -f /etc/pf.conf
+
+    /// Stops the proxy and removes the LaunchAgent. No admin prompt.
+    func uninstallProxy() {
+        _ = runProcess("/bin/launchctl", ["bootout", launchAgentLabel])
+        try? FileManager.default.removeItem(atPath: launchAgentPlistPath)
+        DispatchQueue.main.async {
+            self.installError = nil
+        }
+        checkDaemonStatus()
+    }
+
+    /// Fallback "Restart proxy" action for the settings screen. Not needed
+    /// for normal rule edits (the proxy watches the config file itself),
+    /// but useful if something gets stuck.
+    func restartProxy() {
+        let (status, output) = runProcess("/bin/launchctl", ["kickstart", "-k", launchAgentLabel])
+        DispatchQueue.main.async {
+            self.installError = status == 0 ? nil : "Restart failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
+        }
+        checkDaemonStatus()
+    }
+
+    /// One-time cleanup of the old root LaunchDaemon + PF anchor engine.
+    /// This is the only remaining admin-prompt code path, used purely for
+    /// migration off the legacy install; it is never needed for normal
+    /// operation of the new proxy.
+    func migrateLegacyInstall() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove legacy PF installation?"
+        alert.informativeText = """
+Dory Port Forwarder used to run a root LaunchDaemon that injected redirect \
+rules into the macOS Packet Filter (PF). That approach conflicts with \
+InternetSharing/container networking (it silently disables PF on \
+loopback) and has been replaced by a user-space proxy that needs no root \
+access at all.
+
+This will ask for your admin password once to remove the old \
+LaunchDaemon, its helper script, the PF anchor file, and the PF wiring \
+lines in /etc/pf.conf (a backup is kept at /etc/pf.conf.dory-pf.bak). The \
+live PF ruleset itself is left untouched to avoid disturbing other \
+software's rules.
 """
+        alert.addButton(withTitle: "Clean Up Legacy Install")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let bashCmd = """
+launchctl bootout system/local.dory-pf 2>/dev/null || launchctl bootout system /Library/LaunchDaemons/local.dory-pf.plist 2>/dev/null || true
+/sbin/pfctl -a com.dory.rdr -F nat 2>/dev/null || true
+if [ -f /etc/pf.conf ]; then
+  cp /etc/pf.conf /etc/pf.conf.dory-pf.bak
+fi
+rm -f /Library/LaunchDaemons/local.dory-pf.plist /usr/local/libexec/dory-pf.sh /etc/pf.anchors/com.dory.rdr
+if [ -f /etc/pf.conf ]; then
+  awk '
+    index($0, "# dory-pf:") == 1 { next }
+    $0 == "rdr-anchor \\"com.dory.rdr\\"" { next }
+    $0 == "load anchor \\"com.dory.rdr\\" from \\"/etc/pf.anchors/com.dory.rdr\\"" { next }
+    { print }
+  ' /etc/pf.conf > /etc/pf.conf.dory-pf.new && cat /etc/pf.conf.dory-pf.new > /etc/pf.conf && rm -f /etc/pf.conf.dory-pf.new
+fi
+"""
+        // Deliberately do NOT run `pfctl -f /etc/pf.conf` here: reloading the
+        // live ruleset would also drop InternetSharing's dynamically attached
+        // NAT anchors for container networking. The leftover (now unused)
+        // anchor attachment disappears on the next natural PF reload/reboot.
         let appleScript = NSAppleScript(source: "do shell script (\(appleScriptStringExpression(bashCmd))) with administrator privileges")
         var errorInfo: NSDictionary?
         appleScript?.executeAndReturnError(&errorInfo)
-        
+
         if let error = errorInfo {
             DispatchQueue.main.async {
                 self.installError = error["NSAppleScriptErrorMessage"] as? String ?? "Authorization failed"
@@ -841,7 +819,7 @@ awk '
             DispatchQueue.main.async {
                 self.installError = nil
             }
-            checkDaemonStatus()
+            detectLegacyInstall()
         }
     }
 }
@@ -899,42 +877,54 @@ struct SettingsView: View {
             Divider()
             
             VStack(alignment: .leading, spacing: 8) {
-                Text("LaunchDaemon helper")
+                Text("Proxy service")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                
+
                 HStack {
-                    Image(systemName: manager.isDaemonInstalled ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                        .foregroundColor(manager.isDaemonInstalled ? .green : .orange)
+                    Image(systemName: statusIcon)
+                        .foregroundColor(statusColor)
                         .font(.title3)
-                    Text(manager.isDaemonInstalled ? "Daemon active" : "Daemon not active")
+                    Text(statusText)
                         .font(.subheadline)
                     Spacer()
                 }
-                
-                if manager.isDaemonInstalled {
-                    Button(action: {
-                        manager.uninstallDaemon()
-                    }) {
-                        HStack {
-                            Image(systemName: "trash")
-                            Text("Uninstall Helper Daemon")
+
+                if manager.isProxyInstalled {
+                    HStack(spacing: 12) {
+                        Button(action: {
+                            manager.restartProxy()
+                        }) {
+                            HStack {
+                                Image(systemName: "arrow.clockwise")
+                                Text("Restart Proxy")
+                            }
                         }
-                        .foregroundColor(.red)
+                        .buttonStyle(.bordered)
+
+                        Button(action: {
+                            manager.uninstallProxy()
+                        }) {
+                            HStack {
+                                Image(systemName: "trash")
+                                Text("Uninstall")
+                            }
+                            .foregroundColor(.red)
+                        }
+                        .buttonStyle(.borderless)
                     }
-                    .buttonStyle(.borderless)
                 } else {
                     Button(action: {
-                        manager.installDaemon()
+                        manager.installProxy()
                     }) {
                         HStack {
-                            Image(systemName: "shield.fill")
-                            Text("Install Helper Daemon")
+                            Image(systemName: "bolt.fill")
+                            Text("Install Proxy")
                         }
                     }
                     .buttonStyle(.bordered)
                 }
-                
+
                 if let error = manager.installError {
                     Text(error)
                         .foregroundColor(.red)
@@ -943,13 +933,55 @@ struct SettingsView: View {
                 }
             }
             .padding(.horizontal)
-            
+
+            if manager.legacyDetected {
+                Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                        Text("Legacy PF installation detected")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                    }
+                    Text("A leftover root LaunchDaemon + PF anchor from an older version is still on this Mac. It is unused by the current proxy engine but can be removed.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(action: {
+                        manager.migrateLegacyInstall()
+                    }) {
+                        HStack {
+                            Image(systemName: "trash")
+                            Text("Clean Up Legacy Install")
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .padding(.horizontal)
+            }
+
             Spacer()
         }
-        .frame(width: 320, height: 360)
+        .frame(width: 320, height: manager.legacyDetected ? 440 : 360)
         .onAppear {
             tempPath = manager.configPath
         }
+    }
+
+    private var statusIcon: String {
+        if !manager.isProxyInstalled { return "exclamationmark.triangle.fill" }
+        return manager.isProxyRunning ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+    }
+
+    private var statusColor: Color {
+        if !manager.isProxyInstalled { return .orange }
+        return manager.isProxyRunning ? .green : .orange
+    }
+
+    private var statusText: String {
+        if !manager.isProxyInstalled { return "Proxy not installed" }
+        return manager.isProxyRunning ? "Proxy running" : "Proxy installed but not running"
     }
 }
 
@@ -971,21 +1003,21 @@ struct OnboardingView: View {
             .padding(.horizontal)
             .padding(.top, 16)
             
-            Text("A system helper daemon is required to inject redirection rules into the macOS kernel Packet Filter (PF) as root.")
+            Text("A lightweight background proxy is required to redirect low ports (80, 443, ...) to your local services. It runs entirely in your user account — no admin password, no root, no system-level changes.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.leading)
                 .padding(.horizontal)
-            
+
             Spacer()
-            
+
             VStack(spacing: 12) {
                 Button(action: {
-                    manager.installDaemon()
+                    manager.installProxy()
                 }) {
                     HStack {
-                        Image(systemName: "shield.fill")
-                        Text("Install LaunchDaemon")
+                        Image(systemName: "bolt.fill")
+                        Text("Install Proxy")
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 8)
@@ -1043,7 +1075,7 @@ struct ConflictInfoTooltip: View {
                 }
             }
             
-            Text("PF may still redirect traffic, but the local listener can bypass or interfere with the rule depending on how the connection is made.")
+            Text("Another process (not the Dory proxy) is holding this port, so the proxy cannot bind it and the forward will not work.")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1279,7 +1311,7 @@ struct ContentView: View {
                                         .font(.caption2)
                                         .foregroundColor(.secondary)
                                 }
-                                .help(!isKnown ? "Checking forward status…" : (targetActive ? "Forward is reachable via target port \(forward.toPort) or forwarded port \(forward.fromPort)." : "No reachable listener detected on target port \(forward.toPort) or forwarded port \(forward.fromPort). Verify if your container is running and PF rules are loaded."))
+                                .help(!isKnown ? "Checking forward status…" : (targetActive ? "Backend is reachable on target port \(forward.toPort)." : "No reachable listener detected on target port \(forward.toPort). Verify your service/container is running."))
                                 
                                 Spacer().frame(width: 10)
                                 
@@ -1405,7 +1437,7 @@ struct MainView: View {
         Group {
             if showSettings {
                 SettingsView(manager: manager, showSettings: $showSettings)
-            } else if !manager.isDaemonInstalled {
+            } else if !manager.isProxyInstalled {
                 OnboardingView(manager: manager, showSettings: $showSettings)
             } else {
                 ContentView(manager: manager, showSettings: $showSettings, fromPortStr: $fromPortStr, toPortStr: $toPortStr)
